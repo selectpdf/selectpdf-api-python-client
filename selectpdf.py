@@ -13,7 +13,20 @@ except ImportError:
 	from urllib.error import HTTPError, URLError
 	IS_PYTHON3 = True
 
-import sys, os, json, re
+try:
+    import httplib
+except:
+    import http.client as httplib
+
+try:
+    from urlparse import urlparse
+except:
+    from urllib.parse import urlparse
+
+import sys, os, json, re, time, socket, io, platform
+
+CLIENT_VERSION = '1.4.0'
+"""SelectPdf Python client library version."""
 
 class ApiException(Exception):
     """Exception thrown by SelectPdf API Client."""
@@ -40,8 +53,21 @@ class ApiClient(object):
     
     def __init__(self):    
         self.apiEndpoint = "https://selectpdf.com/api2/convert/"
+        self.apiAsyncEndpoint = "https://selectpdf.com/api2/asyncjob/"
+        self.apiWebElementsEndpoint = "https://selectpdf.com/api2/webelements/"
         self.parameters = dict()
         self.headers = dict()
+        self.files = dict()
+        self.binaryData = dict()
+        self.numberOfPages = 0
+        self.jobId = ""
+        self.lastHTTPCode = 0
+        self.AsyncCallsPingInterval = 3
+        self.AsyncCallsMaxPings = 1000
+        self.MULTIPART_FORM_DATA_BOUNDARY = '------------SelectPdf_Api_Boundry_$'
+        self.NEW_LINE = '\r\n'
+        self.NEW_LINE_BINARY = b'\r\n'
+
 
     def setApiEndpoint(self, apiEndpoint):
         """Set a custom SelectPdf API endpoint. Do not use this method unless advised by SelectPdf.
@@ -51,7 +77,39 @@ class ApiClient(object):
         - apiEndpoint: API endpoint.
         """
 
-    def __performPost__(self, outStream=None):
+        self.apiEndpoint = apiEndpoint
+
+    def setApiAsyncEndpoint(self, apiAsyncEndpoint):
+        """Set a custom SelectPdf API endpoint for async jobs. Do not use this method unless advised by SelectPdf.
+
+        ### Parameters
+
+        - apiAsyncEndpoint: API async jobs endpoint.
+        """
+
+        self.apiAsyncEndpoint = apiAsyncEndpoint
+
+    def setApiWebElementsEndpoint(self, apiWebElementsEndpoint):
+        """Set a custom SelectPdf API endpoint for web elements. Do not use this method unless advised by SelectPdf.
+
+        ### Parameters
+
+        - apiWebElementsEndpoint: API web elements endpoint.
+        """
+
+        self.apiWebElementsEndpoint = apiWebElementsEndpoint
+
+    def getNumberOfPages(self):
+        """Get the number of pages of the PDF document resulted from the API call.
+
+        ### Returns
+
+        Number of pages of the PDF document.
+        """
+
+        return self.numberOfPages
+
+    def _performPost(self, outStream=None):
         """Create a POST request.
 
         ### Parameters
@@ -62,6 +120,13 @@ class ApiClient(object):
         
         If output stream is not specified, return response as string.
         """
+
+        self.headers["selectpdf-api-client"] = "python-{0}-{1}".format(platform.python_version(), CLIENT_VERSION)
+
+        # reset results
+        self.numberOfPages = 0
+        self.jobId = ""
+        self.lastHTTPCode = 0
 
         allheaders = {"Content-type": "application/x-www-form-urlencoded"}
         for k, v in self.headers.items():
@@ -77,22 +142,39 @@ class ApiClient(object):
                 req = urllib2.Request(self.apiEndpoint, urlencode(self.parameters), allheaders)
                 result = urllib2.urlopen(req, None, 600) # timeout in seconds 600s=10minutes
 
-            code = result.getcode();
+            code = result.getcode()
+            self.lastHTTPCode = code
             #print ("Request HTTP Response Code:", code)
 
-            if (code != 200):
-                raise ApiException(result.read(), code)
+            if (code == 200):
+                if IS_PYTHON3:
+                    self.numberOfPages = result.info()['selectpdf-api-pages']
+                    self.jobId = result.info()['selectpdf-api-jobid']
+                else:
+                    self.numberOfPages = result.info().getheader('selectpdf-api-pages')
+                    self.jobId = result.info().getheader('selectpdf-api-jobid')
 
-            if outStream:
-                while True:
-                    bytes = result.read(8192)
-                    if bytes:
-                        outStream.write(bytes)
-                    else:
-                        break
-                return outStream
+                if self.jobId is None: self.jobId = ""
+
+                if outStream:
+                    while True:
+                        bytes = result.read(8192)
+                        if bytes:
+                            outStream.write(bytes)
+                        else:
+                            break
+                    return outStream
+                else:
+                    return result.read()
+            elif (code == 202):
+                if IS_PYTHON3:
+                    self.jobId = result.info()['selectpdf-api-jobid']
+                else:
+                    self.jobId = result.info().getheader('selectpdf-api-jobid')
+
+                if self.jobId is None: self.jobId = ""
             else:
-                return result.read()
+                raise ApiException(result.read(), code)
 
         except HTTPError as e:
             message = e.read()
@@ -103,6 +185,9 @@ class ApiClient(object):
                     message = message.decode()
                 else:
                     pass
+
+            self.lastHTTPCode = e.code
+
             #print("HTTP Error:", e.code, message)
             raise ApiException(message, e.code)
             #print ("HTTP Response Code: {0}\nHTTP Response Message: {1}".format(e.code, e.reason))
@@ -110,7 +195,186 @@ class ApiClient(object):
             raise ApiException("Wrong url.")
             #print ("Wrong url:", e.reason);
         except:
-            raise	        
+            raise
+
+    def _performPostAsMultipartFormData(self, outStream=None):
+        """Create a multipart/form-data POST request (that can handle file uploads).
+
+        ### Parameters
+
+        - outStream: Output response to this stream, if specified.
+
+        ### Returns
+        
+        If output stream is not specified, return response as string.
+        """
+
+        self.headers["selectpdf-api-client"] = "python-{0}-{1}".format(platform.python_version(), CLIENT_VERSION)
+
+        # reset results
+        self.numberOfPages = 0
+        self.jobId = ""
+        self.lastHTTPCode = 0
+
+        # serialize parameters
+        byteData = self.__encodeMultipartFormData()
+        
+        allheaders = {
+            "Content-type": "multipart/form-data; boundary=" + self.MULTIPART_FORM_DATA_BOUNDARY,
+            "Content-length": str(len(byteData))
+        }
+        for k, v in self.headers.items():
+            allheaders[k] = v
+
+        url = urlparse(self.apiEndpoint)        
+
+        result = None
+
+        try:
+            if self.apiEndpoint.startswith("http://"):
+                connection = httplib.HTTPConnection(url.netloc, timeout=600) # timeout in seconds 600s=10minutes
+            else:
+                connection = httplib.HTTPSConnection(url.netloc, timeout=600) # timeout in seconds 600s=10minutes
+
+            connection.request('POST', url.path, byteData, allheaders)
+            result = connection.getresponse()
+
+            code = result.status
+            self.lastHTTPCode = code
+            #print ("Request HTTP Response Code:", code)
+
+            if (code == 200):
+                if IS_PYTHON3:
+                    self.numberOfPages = result.info()['selectpdf-api-pages']
+                    self.jobId = result.info()['selectpdf-api-jobid']
+                else:
+                    self.numberOfPages = result.getheader('selectpdf-api-pages')
+                    self.jobId = result.getheader('selectpdf-api-jobid')
+
+                if self.jobId is None: self.jobId = ""
+
+                if outStream:
+                    while True:
+                        bytes = result.read(8192)
+                        if bytes:
+                            outStream.write(bytes)
+                        else:
+                            break
+                    return outStream
+                else:
+                    return result.read()
+            elif (code == 202):
+                if IS_PYTHON3:
+                    self.jobId = result.info()['selectpdf-api-jobid']
+                else:
+                    self.jobId = result.getheader('selectpdf-api-jobid')
+
+                if self.jobId is None: self.jobId = ""
+            else:
+                raise ApiException(result.read(), code)
+
+        except socket.gaierror as e:
+            raise ApiException("Wrong url.")
+
+        except httplib.InvalidURL as e:
+            raise ApiException("Wrong url.")
+            #print ("Wrong url:", e.reason);
+
+        except httplib.HTTPException as e:
+            message = e.read()
+            if not message:
+                message = e.reason
+            else:
+                if IS_PYTHON3:
+                    message = message.decode()
+                else:
+                    pass
+
+            self.lastHTTPCode = e.code
+
+            #print("HTTP Error:", e.code, message)
+            raise ApiException(message, e.code)
+            #print ("HTTP Response Code: {0}\nHTTP Response Message: {1}".format(e.code, e.reason))
+        except:
+            raise
+
+    def __encodeMultipartFormData(self):
+        """Encode data for multipart/form-data POST"""
+
+        allParameters, finalBoundary = [], []
+        allData = []
+
+        # encode regular parameters
+        for key, value in self.parameters.items():
+            allParameters.append('--' + self.MULTIPART_FORM_DATA_BOUNDARY)
+            allParameters.append('Content-Disposition: form-data; name="%s"' % key)
+            allParameters.append('')
+            allParameters.append(str(value))
+
+        #print(*allParameters, sep = "\n")
+
+        if IS_PYTHON3:
+            allData.append(self.NEW_LINE.join(allParameters).encode('utf-8'))
+        else:
+            allData.append(self.NEW_LINE.join(allParameters))
+
+        # encode files
+        for key, value in self.files.items():
+            allFileEncoding = []
+
+            allFileEncoding.append('--' + self.MULTIPART_FORM_DATA_BOUNDARY)
+            allFileEncoding.append('Content-Disposition: form-data; name="{}"; filename="{}"'.format(key, value))
+            allFileEncoding.append('Content-Type: application/octet-stream')
+            allFileEncoding.append('')
+
+            if IS_PYTHON3:
+                allData.append(self.NEW_LINE.join(allFileEncoding).encode('utf-8'))
+            else:
+                allData.append(self.NEW_LINE.join(allFileEncoding))
+
+            with open(value, 'rb') as f:
+                allData.append(f.read())
+
+        # encode additional binary data
+        for key, value in self.binaryData.items():
+            allFileEncoding = []
+
+            allFileEncoding.append('--' + self.MULTIPART_FORM_DATA_BOUNDARY)
+            allFileEncoding.append('Content-Disposition: form-data; name="{}"; filename="{}"'.format(key, key))
+            allFileEncoding.append('Content-Type: application/octet-stream')
+            allFileEncoding.append('')
+
+            if IS_PYTHON3:
+                allData.append(self.NEW_LINE.join(allFileEncoding).encode('utf-8'))
+            else:
+                allData.append(self.NEW_LINE.join(allFileEncoding))
+
+            allData.append(value)
+
+        # final boundary
+        finalBoundary.append('--' + self.MULTIPART_FORM_DATA_BOUNDARY + '--')
+        finalBoundary.append('')
+
+        if IS_PYTHON3:
+            allData.append(self.NEW_LINE.join(finalBoundary).encode('utf-8'))
+        else:
+            allData.append(self.NEW_LINE.join(finalBoundary))
+
+        return self.NEW_LINE_BINARY.join(allData)
+
+    def _startAsyncJob(self):
+        """Start async job."""
+
+        self.parameters["async"] = True
+        self._performPost()
+        return self.jobId
+
+    def _startAsyncJobMultipartFormData(self):
+        """Start an asynchronous job that requires multipart forma data."""
+
+        self.parameters["async"] = True
+        self._performPostAsMultipartFormData()
+        return self.jobId
 
 class UsageClient(ApiClient):
     """Get usage details for SelectPdf Online API."""
@@ -137,7 +401,7 @@ class UsageClient(ApiClient):
 
         ### Returns
 
-        Array containing usage information.
+        Json containing usage information.
         """
 
         self.headers["Accept"] = "text/json"
@@ -145,14 +409,101 @@ class UsageClient(ApiClient):
         if getHistory:
             self.parameters["get_history"] = "True"
 
-        result = self.__performPost__()
+        result = self._performPost()
         return json.loads(result)
+
+class AsyncJobClient(ApiClient):
+    """Get the result of an asynchronous call."""
+
+    def __init__(self, apiKey, jobId):    
+        """Construct the async job client.
+
+        ### Parameters
+
+        - apiKey: API key.
+        - jobId: Job ID.
+        """
+
+        super(AsyncJobClient, self).__init__()
+
+        self.apiEndpoint = "https://selectpdf.com/api2/asyncjob/"
+        self.parameters["key"] = apiKey
+        self.parameters["job_id"] = jobId
+
+    def getResult(self):
+        """Get result of the asynchronous job.
+
+        ### Returns
+
+        Byte array containing the resulted file if the job is finished. Returns Null if the job is still running. Throws an exception if an error occurred.
+        """
+
+        result = self._performPost()
+        
+        if self.jobId:
+            return False
+        else:
+            return result
+
+    def finished(self):
+        """Check if asynchronous job is finished.
+
+        ### Returns
+
+        True if job finished.
+        """
+
+        if self.lastHTTPCode != 202:
+            return True
+        else:
+            return False
+
+class WebElementsClient(ApiClient):
+    """
+    Get the locations of certain web elements. 
+    This is retrieved if pdf_web_elements_selectors parameter was set during the initial conversion call and elements were found to match the selectors.
+    """
+
+    def __init__(self, apiKey, jobId):    
+        """Construct the Web Elements Client.
+
+        ### Parameters
+
+        - apiKey: API key.
+        - jobId: Job ID.
+        """
+
+        super(WebElementsClient, self).__init__()
+
+        self.apiEndpoint = "https://selectpdf.com/api2/webelements/"
+        self.parameters["key"] = apiKey
+        self.parameters["job_id"] = jobId
+
+    def getWebElements(self):
+        """Get the locations of certain web elements. This is retrieved if pdf_web_elements_selectors parameter is set and elements were found to match the selectors.
+
+        ### Returns
+
+        Json containing web elements locations.
+        """
+
+        self.headers["Accept"] = "text/json"
+
+        result = self._performPost()
+
+        if result:
+            return json.loads(result)
+        else:
+            return []
 
 class PageSize:
     """PDF page size."""
 
     Custom = "Custom"
     """Custom page size."""
+
+    A0 = "A0"
+    """A0 page size."""
 
     A1 = "A1"
     """A1 page size."""
@@ -168,6 +519,15 @@ class PageSize:
 
     A5 = "A5"
     """A5 page size."""
+
+    A6 = "A6"
+    """A6 page size."""
+
+    A7 = "A7"
+    """A7 page size."""
+
+    A8 = "A8"
+    """A8 page size."""
 
     Letter = "Letter"
     """Letter page size."""
@@ -271,6 +631,24 @@ class StartupMode:
     Manual = "Manual"
     """The conversion starts only when called from JavaScript."""
 
+class TextLayout:
+    """The output text layout (for pdf to text calls)."""
+
+    Original = 0
+    """The original layout of the text from the PDF document is preserved."""
+
+    Reading = 1
+    """The text is produced in reading order."""
+
+class OutputFormat:
+    """The output format (for pdf to text calls)."""
+
+    Text = 0
+    """Text"""
+
+    Html = 1
+    """Html"""
+
 
 class HtmlToPdfClient(ApiClient):
     """Html To Pdf Conversion with SelectPdf Online API."""
@@ -307,7 +685,11 @@ class HtmlToPdfClient(ApiClient):
             raise ApiException("Cannot convert local urls. SelectPdf online API can only convert publicly available urls.")
 
         self.parameters["url"] = url
-        return self.__performPost__()
+        self.parameters["html"] = ""
+        self.parameters["base_url"] = ""
+        self.parameters["async"] = False
+
+        return self._performPost()
 
     def convertUrlToStream(self, url, stream):
         """Convert the specified url to PDF and writes the resulted PDF to an output stream. SelectPdf online API can convert http:// and https:// publicly available urls.
@@ -325,7 +707,11 @@ class HtmlToPdfClient(ApiClient):
             raise ApiException("Cannot convert local urls. SelectPdf online API can only convert publicly available urls.")
 
         self.parameters["url"] = url
-        return self.__performPost__(stream)
+        self.parameters["html"] = ""
+        self.parameters["base_url"] = ""
+        self.parameters["async"] = False
+
+        return self._performPost(stream)
 
     def convertUrlToFile(self, url, filePath):
         """Convert the specified url to PDF and writes the resulted PDF to a local file. SelectPdf online API can convert http:// and https:// publicly available urls.
@@ -351,6 +737,86 @@ class HtmlToPdfClient(ApiClient):
             os.remove(filePath)
             raise
 
+    def convertUrlAsync(self, url):
+        """Convert the specified url to PDF using an asynchronous call. SelectPdf online API can convert http:// and https:// publicly available urls.
+
+        ### Parameters
+
+        - url: Address of the web page being converted.
+        
+        ### Returns
+
+        Resulted PDF.
+        """
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            raise ApiException("The supported protocols for the converted webpage are http:// and https://.")
+        
+        if url.startswith("http://localhost"):
+            raise ApiException("Cannot convert local urls. SelectPdf online API can only convert publicly available urls.")
+
+        self.parameters["url"] = url
+        self.parameters["html"] = ""
+        self.parameters["base_url"] = ""
+        
+        JobID = self._startAsyncJob()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+
+                return result
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def convertUrlToFileAsync(self, url, filePath):
+        """Convert the specified url to PDF using an asynchronous call and writes the resulted PDF to a local file. 
+        SelectPdf online API can convert http:// and https:// publicly available urls.
+
+        ### Parameters
+
+        - url: Address of the web page being converted.
+        - filePath: Local file including path if necessary.
+        """
+
+        outputFile = open(filePath, 'wb')
+        try:
+            result = self.convertUrlAsync(url)
+            outputFile.write(result)
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(filePath)
+            raise
+
+    def convertUrlToStreamAsync(self, url, stream):
+        """Convert the specified url to PDF using an asynchronous and writes the resulted PDF to an output stream. 
+        SelectPdf online API can convert http:// and https:// publicly available urls.
+
+        ### Parameters
+
+        - url: Address of the web page being converted.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.convertUrlAsync(url)
+        stream.write(result)
+
     def convertHtmlStringWithBaseUrl(self, htmlString, baseUrl):
         """Convert the specified HTML string to PDF. Use a base url to resolve relative paths to resources.
 
@@ -364,14 +830,16 @@ class HtmlToPdfClient(ApiClient):
         The resulted PDF.
         """
 
+        self.parameters["url"] = ""
+        self.parameters["async"] = False
         self.parameters["html"] = htmlString
 
         if baseUrl and baseUrl.strip():
             self.parameters["base_url"] = baseUrl
 
-        return self.__performPost__()
+        return self._performPost()
 
-    def convertHtmlStringToStreamWithBaseUrl(self, htmlString, baseUrl, stream):
+    def convertHtmlStringWithBaseUrlToStream(self, htmlString, baseUrl, stream):
         """Convert the specified HTML string to PDF and writes the resulted PDF to an output stream. Use a base url to resolve relative paths to resources.
 
         ### Parameters
@@ -381,14 +849,16 @@ class HtmlToPdfClient(ApiClient):
         - stream: The output stream where the resulted PDF will be written.
         """
 
+        self.parameters["url"] = ""
+        self.parameters["async"] = False
         self.parameters["html"] = htmlString
 
         if baseUrl and baseUrl.strip():
             self.parameters["base_url"] = baseUrl
 
-        return self.__performPost__(stream)
+        return self._performPost(stream)
 
-    def convertHtmlStringToFileWithBaseUrl(self, htmlString, baseUrl, filePath):
+    def convertHtmlStringWithBaseUrlToFile(self, htmlString, baseUrl, filePath):
         """Convert the specified HTML string to PDF and writes the resulted PDF to a local file. Use a base url to resolve relative paths to resources.
 
         ### Parameters
@@ -400,7 +870,85 @@ class HtmlToPdfClient(ApiClient):
 
         outputFile = open(filePath, 'wb')
         try:
-            self.convertHtmlStringToStreamWithBaseUrl(htmlString, baseUrl, outputFile)
+            self.convertHtmlStringWithBaseUrlToStream(htmlString, baseUrl, outputFile)
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(filePath)
+            raise
+
+    def convertHtmlStringWithBaseUrlAsync(self, htmlString, baseUrl):
+        """Convert the specified HTML string to PDF with an asynchronous call. Use a base url to resolve relative paths to resources.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+        - baseUrl: Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+
+        ### Returns
+
+        The resulted PDF.
+        """
+
+        self.parameters["url"] = ""
+        self.parameters["html"] = htmlString
+
+        if baseUrl and baseUrl.strip():
+            self.parameters["base_url"] = baseUrl
+
+        JobID = self._startAsyncJob()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+
+                return result
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def convertHtmlStringWithBaseUrlToStreamAsync(self, htmlString, baseUrl, stream):
+        """Convert the specified HTML string to PDF with an asynchronous call and writes the resulted PDF to an output stream. 
+        Use a base url to resolve relative paths to resources.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+        - baseUrl: Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.convertHtmlStringWithBaseUrlAsync(htmlString, baseUrl)
+        stream.write(result)
+
+    def convertHtmlStringWithBaseUrlToFileAsync(self, htmlString, baseUrl, filePath):
+        """Convert the specified HTML string to PDF with an asynchronous call and writes the resulted PDF to a local file. 
+        Use a base url to resolve relative paths to resources.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+        - baseUrl: Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+        - filePath: Local file including path if necessary.
+        """
+
+        outputFile = open(filePath, 'wb')
+        try:
+            self.convertHtmlStringWithBaseUrlToStreamAsync(htmlString, baseUrl, outputFile)
             outputFile.close()
         except ApiException:
             outputFile.close()
@@ -430,7 +978,7 @@ class HtmlToPdfClient(ApiClient):
         - stream: The output stream where the resulted PDF will be written.
         """
 
-        return self.convertHtmlStringToStreamWithBaseUrl(htmlString, None, stream)
+        return self.convertHtmlStringWithBaseUrlToStream(htmlString, None, stream)
 
     def convertHtmlStringToFile(self, htmlString, filePath):
         """Convert the specified HTML string to PDF and writes the resulted PDF to a local file.
@@ -441,7 +989,43 @@ class HtmlToPdfClient(ApiClient):
         - filePath: Local file including path if necessary.
         """
 
-        return self.convertHtmlStringToFileWithBaseUrl(htmlString, None, filePath)
+        return self.convertHtmlStringWithBaseUrlToFile(htmlString, None, filePath)
+
+    def convertHtmlStringAsync(self, htmlString):
+        """Convert the specified HTML string to PDF with an asynchronous call.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+
+        ### Returns
+
+        The resulted PDF.
+        """
+
+        return self.convertHtmlStringWithBaseUrlAsync(htmlString, None)
+
+    def convertHtmlStringToStreamAsync(self, htmlString, stream):
+        """Convert the specified HTML string to PDF with an asynchronous call and writes the resulted PDF to an output stream.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        return self.convertHtmlStringWithBaseUrlToStreamAsync(htmlString, None, stream)
+
+    def convertHtmlStringToFileAsync(self, htmlString, filePath):
+        """Convert the specified HTML string to PDF with an asynchronous call and writes the resulted PDF to a local file.
+
+        ### Parameters
+
+        - htmlString: HTML string with the content being converted.
+        - filePath: Local file including path if necessary.
+        """
+
+        return self.convertHtmlStringWithBaseUrlToFileAsync(htmlString, None, filePath)
 
     def setPageSize(self, pageSize):
         """Set PDF page size. Default value is A4. If page size is set to Custom, use setPageWidth and setPageHeight methods to set the custom width/height of the PDF pages.
@@ -1218,6 +1802,36 @@ class HtmlToPdfClient(ApiClient):
         self.parameters["header_display_on_even_pages"] = displayOnEvenPages
         return self
 
+    def setHeaderWebPageWidth(self, headerWebPageWidth):
+        """Set the width in pixels used by the converter's internal browser window during the conversion of the header content. The default value is 1024px.
+
+        ### Parameters
+
+        - headerWebPageWidth: Browser window width in pixels.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["header_web_page_width"] = headerWebPageWidth
+        return self
+    
+    def setHeaderWebPageHeight(self, headerWebPageHeight):
+        """Set the height in pixels used by the converter's internal browser window during the conversion of the header content. The default value is 0px and it means that the page height is automatically calculated by the converter.
+
+        ### Parameters
+
+        - headerWebPageHeight: Browser window height in pixels. Set it to 0px to automatically calculate page height.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["header_web_page_height"] = headerWebPageHeight
+        return self
+
     def setShowFooter(self, showFooter):
         """Control if a custom footer is displayed in the generated PDF document. The default value is False.
 
@@ -1366,6 +1980,36 @@ class HtmlToPdfClient(ApiClient):
         """
 
         self.parameters["footer_display_on_last_page"] = displayOnLastPage
+        return self
+
+    def setFooterWebPageWidth(self, footerWebPageWidth):
+        """Set the width in pixels used by the converter's internal browser window during the conversion of the footer content. The default value is 1024px.
+
+        ### Parameters
+
+        - footerWebPageWidth: Browser window width in pixels.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["footer_web_page_width"] = footerWebPageWidth
+        return self
+    
+    def setFooterWebPageHeight(self, footerWebPageHeight):
+        """Set the height in pixels used by the converter's internal browser window during the conversion of the footer content. The default value is 0px and it means that the page height is automatically calculated by the converter.
+
+        ### Parameters
+
+        - footerWebPageHeight: Browser window height in pixels. Set it to 0px to automatically calculate page height.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["footer_web_page_height"] = footerWebPageHeight
         return self
 
     def setShowPageNumbers(self, showPageNumbers):
@@ -1518,7 +2162,7 @@ class HtmlToPdfClient(ApiClient):
 
         ### Parameters
 
-        - selectors: CSS selectors used to identify HTML elements.
+        - selectors: CSS selectors used to identify HTML elements, comma separated.
 
         ### Returns
 
@@ -1536,7 +2180,7 @@ class HtmlToPdfClient(ApiClient):
 
         ### Parameters
 
-        - selectors: CSS selectors used to identify HTML elements.
+        - selectors: CSS selectors used to identify HTML elements, comma separated.
 
         ### Returns
 
@@ -1560,6 +2204,24 @@ class HtmlToPdfClient(ApiClient):
         """
 
         self.parameters["pdf_show_only_element_id"] = elementID
+        return self
+
+    def setPdfWebElementsSelectors(self, selectors):
+        """Get the locations of page elements from the conversion. The elements that will have their locations retrieved are defined using CSS selectors.  
+        For example, the selector for all the H1 elements is "H1", the selector for all the elements with the CSS class name 'myclass' is "*.myclass" and 
+        the selector for the elements with the id 'myid' is "*#myid". 
+        Read more about CSS selectors <a href="http://www.w3schools.com/cssref/css_selectors.asp" target="_blank">here</a>.
+
+        ### Parameters
+
+        - selectors: CSS selectors used to identify HTML elements, comma separated.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["pdf_web_elements_selectors"] = selectors
         return self
 
     def setStartupMode(self, startupMode):
@@ -1643,4 +2305,1225 @@ class HtmlToPdfClient(ApiClient):
         """
         
         self.parameters["page_breaks_enhanced_algorithm"] = enableEnhancedPageBreaksAlgorithm
+        return self
+
+    def setCookies(self, cookies):
+        """Set HTTP cookies for the web page being converted.
+
+        ### Parameters
+
+        - cookies: Dictionary with HTTP cookies that will be sent to the page being converted.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.parameters["cookies_string"] = urlencode(cookies)
+        return self
+
+    def setCustomParameter(self, parameterName, parameterValue):
+        """Set a custom parameter. Do not use this method unless advised by SelectPdf.
+
+        ### Parameters
+
+        - parameterName: Parameter name.
+        - parameterValue: Parameter value.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.parameters[parameterName] = parameterValue
+        return self
+
+    def getWebElements(self):
+        """Get the locations of certain web elements. This is retrieved if pdf_web_elements_selectors parameter is set and elements were found to match the selectors.
+
+        ### Returns
+
+        Json with web elements locations.
+        """
+
+        webElementsClient = WebElementsClient(self.parameters["key"], self.jobId)
+        webElementsClient.setApiEndpoint(self.apiWebElementsEndpoint)
+
+        return webElementsClient.getWebElements()
+
+class PdfMergeClient(ApiClient):
+    """Pdf Merge with SelectPdf Online API."""
+
+    def __init__(self, apiKey):    
+        """Construct the Pdf Merge Client.
+
+        ### Parameters
+
+        - apiKey: API key.
+        """
+
+        super(PdfMergeClient, self).__init__()
+
+        self.apiEndpoint = "https://selectpdf.com/api2/pdfmerge/"
+        self.parameters["key"] = apiKey
+        self.fileIdx = 0
+
+    def addFile(self, inputPdf):
+        """Add local PDF document to the list of input files.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.fileIdx += 1
+
+        self.files["file_" + str(self.fileIdx)] = inputPdf
+        self.parameters.pop("url_" + str(self.fileIdx), None)
+        self.parameters.pop("password_" + str(self.fileIdx), None)
+
+        return self
+
+    def addFileWithPassword(self, inputPdf, userPassword):
+        """Add local PDF document to the list of input files.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - userPassword: User password for the PDF document.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.fileIdx += 1
+
+        self.files["file_" + str(self.fileIdx)] = inputPdf
+        self.parameters.pop("url_" + str(self.fileIdx), None)
+        self.parameters["password_" + str(self.fileIdx)] = userPassword
+
+        return self
+
+    def addUrlFile(self, inputUrl):
+        """Add remote PDF document to the list of input files.
+
+        ### Parameters
+
+        - inputUrl: Url of a remote PDF file.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.fileIdx += 1 
+
+        self.parameters["url_" + str(self.fileIdx)] = inputUrl
+        self.parameters.pop("password_" + str(self.fileIdx), None)
+
+        return self
+
+    def addUrlFileWithPassword(self, inputUrl, userPassword):
+        """Add remote PDF document to the list of input files.
+
+        ### Parameters
+
+        - inputUrl: Url of a remote PDF file.
+        - userPassword: User password for the PDF document.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.fileIdx += 1
+
+        self.parameters["url_" + str(self.fileIdx)] = inputUrl
+        self.parameters["password_" + str(self.fileIdx)] = userPassword
+
+        return self
+    
+    def save(self):
+        """Merge all specified input pdfs and return the resulted PDF.
+
+        ### Returns
+
+        Byte array containing the resulted PDF.
+        """
+        
+        self.parameters["async"] = "False"
+        self.parameters["files_no"] = self.fileIdx
+
+        result = self._performPostAsMultipartFormData()
+
+        self.fileIdx = 0
+        self.files = dict()
+
+        return result
+
+    def saveToFile(self, filePath):
+        """Merge all specified input pdfs and writes the resulted PDF to a local file.
+
+        ### Parameters
+
+        - filePath: Local output file including path if necessary.
+        """
+        
+        self.parameters["async"] = "False"
+        self.parameters["files_no"] = self.fileIdx
+
+        outputFile = open(filePath, 'wb')
+        try:
+            result = self._performPostAsMultipartFormData()
+
+            outputFile.write(result)
+            outputFile.close()
+
+            self.fileIdx = 0
+            self.files = dict()
+        except ApiException:
+            outputFile.close()
+            os.remove(filePath)
+
+            self.fileIdx = 0
+            self.files = dict()
+
+            raise
+
+    def saveToStream(self, stream):
+        """Merge all specified input pdfs and writes the resulted PDF to a specified stream.
+
+        ### Parameters
+
+        - stream: The output stream where the resulted PDF will be written.
+        """
+        
+        self.parameters["async"] = "False"
+        self.parameters["files_no"] = self.fileIdx
+
+        result = self._performPostAsMultipartFormData()
+        stream.write(result)
+
+        self.fileIdx = 0
+        self.files = dict()
+
+    def saveAsync(self):
+        """Merge all specified input pdfs and return the resulted PDF. An asynchronous call is used.
+
+        ### Returns
+
+        Resulted PDF.
+        """
+
+        self.parameters["files_no"] = self.fileIdx
+        
+        JobID = self._startAsyncJobMultipartFormData()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+
+                self.fileIdx = 0
+                self.files = dict()
+
+                return result
+
+        self.fileIdx = 0
+        self.files = dict()
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def saveToFileAsync(self, filePath):
+        """Merge all specified input pdfs and writes the resulted PDF to a local file. An asynchronous call is used.
+
+        ### Parameters
+
+        - filePath: Local file including path if necessary.
+        """
+
+        outputFile = open(filePath, 'wb')
+        try:
+            result = self.saveAsync()
+            outputFile.write(result)
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(filePath)
+            raise
+
+    def saveToStreamAsync(self, stream):
+        """Merge all specified input pdfs and writes the resulted PDF to a specified stream. An asynchronous call is used.
+
+        ### Parameters
+
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.saveAsync()
+        stream.write(result)
+
+    def setDocTitle(self, docTitle):
+        """Set the PDF document title.
+
+        ### Parameters
+
+        - docTitle: Document title.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["doc_title"] = docTitle
+        return self
+
+    def setDocSubject(self, docSubject):
+        """Set the subject of the PDF document.
+
+        ### Parameters
+
+        - docSubject: Document subject.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["doc_subject"] = docSubject
+        return self
+
+    def setDocKeywords(self, docKeywords):
+        """Set the PDF document keywords.
+
+        ### Parameters
+
+        - docKeywords: Document keywords.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["doc_keywords"] = docKeywords
+        return self
+
+    def setDocAuthor(self, docAuthor):
+        """Set the name of the PDF document author.
+
+        ### Parameters
+
+        - docAuthor: Document author.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["doc_author"] = docAuthor
+        return self
+
+    def setDocAddCreationDate(self, docAddCreationDate):
+        """Add the date and time when the PDF document was created to the PDF document information. The default value is False.
+
+        ### Parameters
+
+        - docAddCreationDate: Add creation date to the document metadata or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["doc_add_creation_date"] = docAddCreationDate
+        return self
+
+    def setViewerPageLayout(self, pageLayout):
+        """Set the page layout to be used when the document is opened in a PDF viewer. The default value is 1 - OneColumn.
+
+        ### Parameters
+
+        - pageLayout: Page layout. Possible values: 0 (Single Page), 1 (One Column), 2 (Two Column Left), 3 (Two Column Right). Use constants from selectpdf.PageLayout class.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        if pageLayout != 0 and pageLayout != 1 and pageLayout != 2 and pageLayout != 3:
+            raise ApiException("Allowed values for Page Layout: 0 (Single Page), 1 (One Column), 2 (Two Column Left), 3 (Two Column Right).")
+
+        self.parameters["viewer_page_layout"] = pageLayout
+        return self
+
+    def setViewerPageMode(self, pageMode):
+        """Set the document page mode when the pdf document is opened in a PDF viewer. The default value is 0 - UseNone.
+
+        ### Parameters
+
+        - pageMode: Page mode. Possible values: 0 (Use None), 1 (Use Outlines), 2 (Use Thumbs), 3 (Full Screen), 4 (Use OC), 5 (Use Attachments). Use constants from selectpdf.PageMode class.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        if pageMode != 0 and pageMode != 1 and pageMode != 2 and pageMode != 3 and pageMode != 4 and pageMode != 5:
+            raise ApiException("Allowed values for Page Mode: 0 (Use None), 1 (Use Outlines), 2 (Use Thumbs), 3 (Full Screen), 4 (Use OC), 5 (Use Attachments).")
+
+        self.parameters["viewer_page_mode"] = pageMode
+        return self
+
+    def setViewerCenterWindow(self, viewerCenterWindow):
+        """Set a flag specifying whether to position the document's window in the center of the screen. The default value is False.
+
+        ### Parameters
+
+        - viewerCenterWindow: Center window or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_center_window"] = viewerCenterWindow
+        return self
+
+    def setViewerDisplayDocTitle(self, viewerDisplayDocTitle):
+        """Set a flag specifying whether the window's title bar should display the document title taken from document information. The default value is False.
+
+        ### Parameters
+
+        - viewerDisplayDocTitle: Display title or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_display_doc_title"] = viewerDisplayDocTitle
+        return self
+
+    def setViewerFitWindow(self, viewerFitWindow):
+        """Set a flag specifying whether to resize the document's window to fit the size of the first displayed page. The default value is False.
+
+        ### Parameters
+
+        - viewerFitWindow: Fit window or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_fit_window"] = viewerFitWindow
+        return self
+
+    def setViewerHideMenuBar(self, viewerHideMenuBar):
+        """Set a flag specifying whether to hide the pdf viewer application's menu bar when the document is active. The default value is False.
+
+        ### Parameters
+
+        - viewerHideMenuBar: Hide menu bar or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_hide_menu_bar"] = viewerHideMenuBar
+        return self
+
+    def setViewerHideToolbar(self, viewerHideToolbar):
+        """Set a flag specifying whether to hide the pdf viewer application's tool bars when the document is active. The default value is False.
+
+        ### Parameters
+
+        - viewerHideToolbar: Hide tool bars or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_hide_toolbar"] = viewerHideToolbar
+        return self
+
+    def setViewerHideWindowUI(self, viewerHideWindowUI):
+        """Set a flag specifying whether to hide user interface elements in the document's window (such as scroll bars and navigation controls), leaving only the document's contents displayed.
+
+        ### Parameters
+
+        - viewerHideWindowUI: Hide window UI or not.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["viewer_hide_window_ui"] = viewerHideWindowUI
+        return self
+
+    def setUserPassword(self, userPassword):
+        """Set PDF user password.
+
+        ### Parameters
+
+        - userPassword: PDF user password.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["user_password"] = userPassword
+        return self
+
+    def setOwnerPassword(self, ownerPassword):
+        """Set PDF owner password.
+
+        ### Parameters
+
+        - ownerPassword: PDF owner password.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["owner_password"] = ownerPassword
+        return self
+        
+    def setCustomParameter(self, parameterName, parameterValue):
+        """Set a custom parameter. Do not use this method unless advised by SelectPdf.
+
+        ### Parameters
+
+        - parameterName: Parameter name.
+        - parameterValues: Parameter value.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.parameters[parameterName] = parameterValue
+        return self
+
+    def setTimeout(self, timeout):
+        """
+        Set the maximum amount of time (in seconds) for this job.
+        The default value is 30 seconds. 
+        Use a larger value (up to 120 seconds allowed) for pages that take a long time to load.
+
+        ### Parameters
+
+        - timeout: Timeout in seconds.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["timeout"] = timeout
+        return self
+
+class PdfToTextClient(ApiClient):
+    """Pdf To Text Conversion with SelectPdf Online API."""
+
+    def __init__(self, apiKey):    
+        """Construct the Pdf To Text Client.
+
+        ### Parameters
+
+        - apiKey: API key.
+        """
+
+        super(PdfToTextClient, self).__init__()
+
+        self.apiEndpoint = "https://selectpdf.com/api2/pdftotext/"
+        self.parameters["key"] = apiKey
+        self.fileIdx = 0
+
+    def __format_text__(self, text):
+        """Format text to UTF-8
+
+        ### Parameters
+
+        - text: Text to be formatted.
+
+        ### Returns
+
+        Formatted text.
+        """
+
+        if IS_PYTHON3:
+            # Python 3
+            try:
+                return text.decode("utf-8").replace('\r', '')
+            except AttributeError:
+                pass
+        else:
+            # Python 2
+            if isinstance(text, unicode):
+                return text.encode('utf-8').replace('\r', '')
+        return text.replace('\r', '')
+
+
+    def getTextFromFile(self, inputPdf):
+        """Get the text from the specified pdf.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+
+        ### Returns
+
+        Extracted text.
+        """
+
+        self.parameters["async"] = False
+        self.parameters["action"] = "Convert"
+        self.parameters["url"] = ""
+
+        self.files = dict()
+        self.files["inputPdf"] = inputPdf
+
+        result = self._performPostAsMultipartFormData()
+        return self.__format_text__(result)
+
+    def getTextFromFileToFile(self, inputPdf, outputFilePath):
+        """Get the text from the specified pdf and write it to the specified text file.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - outputFilePath: The output file where the resulted text will be written.
+        """
+
+        outputFile = io.open(outputFilePath, 'w', encoding='utf-8')
+        try:
+            result = self.getTextFromFile(inputPdf)
+
+            if IS_PYTHON3:
+                outputFile.write(result)
+            else:
+                if isinstance(result, str):
+                    outputFile.write(unicode(result, 'UTF-8'))
+                else:
+                    outputFile.write(result)
+
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(outputFilePath)
+            raise
+
+    def getTextFromFileToStream(self, inputPdf, stream):
+        """Get the text from the specified pdf and write it to the specified stream.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.getTextFromFile(inputPdf)
+
+        if IS_PYTHON3:
+            stream.write(result)
+        else:
+            if isinstance(result, str):
+                stream.write(unicode(result, 'UTF-8'))
+            else:
+                stream.write(result)
+
+    def getTextFromFileAsync(self, inputPdf):
+        """Get the text from the specified pdf with an asynchronous call.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+
+        ### Returns
+
+        Extracted text.
+        """
+
+        self.parameters["action"] = "Convert"
+        self.parameters["url"] = ""
+
+        self.files = dict()
+        self.files["inputPdf"] = inputPdf
+        
+        JobID = self._startAsyncJobMultipartFormData()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+
+                return self.__format_text__(result)
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def getTextFromFileToFileAsync(self, inputPdf, outputFilePath):
+        """Get the text from the specified pdf with an asynchronous call and write it to the specified text file.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - outputFilePath: The output file where the resulted text will be written.
+        """
+
+        outputFile = io.open(outputFilePath, 'w', encoding='utf-8')
+        try:
+            result = self.getTextFromFileAsync(inputPdf)
+
+            if IS_PYTHON3:
+                outputFile.write(result)
+            else:
+                if isinstance(result, str):
+                    outputFile.write(unicode(result, 'UTF-8'))
+                else:
+                    outputFile.write(result)
+
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(outputFilePath)
+            raise
+
+    def getTextFromFileToStreamAsync(self, inputPdf, stream):
+        """Get the text from the specified pdf with an asynchronous call and write it to the specified stream.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.getTextFromFileAsync(inputPdf)
+
+        if IS_PYTHON3:
+            stream.write(result)
+        else:
+            if isinstance(result, str):
+                stream.write(unicode(result, 'UTF-8'))
+            else:
+                stream.write(result)
+
+    def getTextFromUrl(self, url):
+        """Get the text from the specified pdf.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+
+        ### Returns
+
+        Extracted text.
+        """
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            raise ApiException("The supported protocols for the PDFs available online are http:// and https://.")
+        
+        if url.startswith("http://localhost"):
+            raise ApiException("Cannot convert local urls via this method. Use getTextFromFile instead.")
+
+        self.parameters["async"] = False
+        self.parameters["action"] = "Convert"
+        self.parameters["url"] = url
+
+        self.files = dict()
+
+        result = self._performPostAsMultipartFormData()
+        return self.__format_text__(result)
+
+    def getTextFromUrlToFile(self, url, outputFilePath):
+        """Get the text from the specified pdf and write it to the specified text file.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - outputFilePath: The output file where the resulted text will be written.
+        """
+
+        outputFile = io.open(outputFilePath, 'w', encoding='utf-8')
+        try:
+            result = self.getTextFromUrl(url)
+
+            if IS_PYTHON3:
+                outputFile.write(result)
+            else:
+                if isinstance(result, str):
+                    outputFile.write(unicode(result, 'UTF-8'))
+                else:
+                    outputFile.write(result)
+
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(outputFilePath)
+            raise
+
+    def getTextFromUrlToStream(self, url, stream):
+        """Get the text from the specified pdf and write it to the specified stream.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.getTextFromUrl(url)
+
+        if IS_PYTHON3:
+            stream.write(result)
+        else:
+            if isinstance(result, str):
+                stream.write(unicode(result, 'UTF-8'))
+            else:
+                stream.write(result)
+
+    def getTextFromUrlAsync(self, url):
+        """Get the text from the specified pdf with an asynchronous call.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+
+        ### Returns
+
+        Extracted text.
+        """
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            raise ApiException("The supported protocols for the PDFs available online are http:// and https://.")
+        
+        if url.startswith("http://localhost"):
+            raise ApiException("Cannot convert local urls via this method. Use getTextFromFileAsync instead.")
+
+        self.parameters["action"] = "Convert"
+        self.parameters["url"] = url
+
+        self.files = dict()
+        
+        JobID = self._startAsyncJobMultipartFormData()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+
+                return self.__format_text__(result)
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def getTextFromUrlToFileAsync(self, url, outputFilePath):
+        """Get the text from the specified pdf with an asynchronous call and write it to the specified text file.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - outputFilePath: The output file where the resulted text will be written.
+        """
+
+        outputFile = io.open(outputFilePath, 'w', encoding='utf-8')
+        try:
+            result = self.getTextFromUrlAsync(url)
+
+            if IS_PYTHON3:
+                outputFile.write(result)
+            else:
+                if isinstance(result, str):
+                    outputFile.write(unicode(result, 'UTF-8'))
+                else:
+                    outputFile.write(result)
+
+            outputFile.close()
+        except ApiException:
+            outputFile.close()
+            os.remove(outputFilePath)
+            raise
+
+    def getTextFromUrlToStreamAsync(self, url, stream):
+        """Get the text from the specified pdf with an asynchronous call and write it to the specified stream.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - stream: The output stream where the resulted PDF will be written.
+        """
+
+        result = self.getTextFromUrlAsync(url)
+
+        if IS_PYTHON3:
+            stream.write(result)
+        else:
+            if isinstance(result, str):
+                stream.write(unicode(result, 'UTF-8'))
+            else:
+                stream.write(result)
+
+    def searchFile(self, inputPdf, textToSearch, caseSensitive=False, wholeWordsOnly=False):
+        """Search for a specific text in a PDF document.
+        Pages that participate to this operation are specified by setStartPage() and setEndPage() methods.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - textToSearch: Text to search.
+        - caseSensitive: If the search is case sensitive or not.
+        - wholeWordsOnly: If the search works on whole words or not.
+
+        ### Returns
+
+        List with text positions in the current PDF document.
+        """
+
+        if not textToSearch:
+            raise ApiException("Search text cannot be empty.")
+
+        self.parameters["async"] = "False"
+        self.parameters["action"] = "Search"
+        self.parameters["url"] = ""
+        self.parameters["search_text"] = textToSearch
+        self.parameters["case_sensitive"] = caseSensitive
+        self.parameters["whole_words_only"] = wholeWordsOnly
+
+        self.files = dict()
+        self.files["inputPdf"] = inputPdf
+
+        self.headers["Accept"] = "text/json"
+
+        result = self._performPostAsMultipartFormData()
+        if result:
+            return json.loads(result)
+        else:
+            return []
+
+    def searchFileAsync(self, inputPdf, textToSearch, caseSensitive=False, wholeWordsOnly=False):
+        """Search for a specific text in a PDF document with an asynchronous call.
+        Pages that participate to this operation are specified by setStartPage() and setEndPage() methods.
+
+        ### Parameters
+
+        - inputPdf: Path to a local PDF file.
+        - textToSearch: Text to search.
+        - caseSensitive: If the search is case sensitive or not.
+        - wholeWordsOnly: If the search works on whole words or not.
+
+        ### Returns
+
+        List with text positions in the current PDF document.
+        """
+
+        if not textToSearch:
+            raise ApiException("Search text cannot be empty.")
+
+        self.parameters["action"] = "Search"
+        self.parameters["url"] = ""
+        self.parameters["search_text"] = textToSearch
+        self.parameters["case_sensitive"] = caseSensitive
+        self.parameters["whole_words_only"] = wholeWordsOnly
+
+        self.files = dict()
+        self.files["inputPdf"] = inputPdf
+
+        self.headers["Accept"] = "text/json"
+
+        JobID = self._startAsyncJobMultipartFormData()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+                if result:
+                    return json.loads(result)
+                else:
+                    return []
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def searchUrl(self, url, textToSearch, caseSensitive=False, wholeWordsOnly=False):
+        """Search for a specific text in a PDF document.
+        Pages that participate to this operation are specified by setStartPage() and setEndPage() methods.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - textToSearch: Text to search.
+        - caseSensitive: If the search is case sensitive or not.
+        - wholeWordsOnly: If the search works on whole words or not.
+
+        ### Returns
+
+        List with text positions in the current PDF document.
+        """
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            raise ApiException("The supported protocols for the PDFs available online are http:// and https://.")
+        
+        if url.startswith("http://localhost"):
+            raise ApiException("Cannot search local urls via this method. Use searchFile instead.")
+
+        if not textToSearch:
+            raise ApiException("Search text cannot be empty.")
+
+        self.parameters["async"] = "False"
+        self.parameters["action"] = "Search"
+        self.parameters["search_text"] = textToSearch
+        self.parameters["case_sensitive"] = caseSensitive
+        self.parameters["whole_words_only"] = wholeWordsOnly
+
+        self.files = dict()
+        self.parameters["url"] = url
+
+        self.headers["Accept"] = "text/json"
+
+        result = self._performPostAsMultipartFormData()
+        if result:
+            return json.loads(result)
+        else:
+            return []
+
+    def searchUrlAsync(self, url, textToSearch, caseSensitive=False, wholeWordsOnly=False):
+        """Search for a specific text in a PDF document with an asynchronous call.
+        Pages that participate to this operation are specified by setStartPage() and setEndPage() methods.
+
+        ### Parameters
+
+        - url: Address of the PDF file.
+        - textToSearch: Text to search.
+        - caseSensitive: If the search is case sensitive or not.
+        - wholeWordsOnly: If the search works on whole words or not.
+
+        ### Returns
+
+        List with text positions in the current PDF document.
+        """
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            raise ApiException("The supported protocols for the PDFs available online are http:// and https://.")
+        
+        if url.startswith("http://localhost"):
+            raise ApiException("Cannot search local urls via this method. Use searchFileAsync instead.")
+
+        if not textToSearch:
+            raise ApiException("Search text cannot be empty.")
+
+        self.parameters["action"] = "Search"
+        self.parameters["search_text"] = textToSearch
+        self.parameters["case_sensitive"] = caseSensitive
+        self.parameters["whole_words_only"] = wholeWordsOnly
+
+        self.files = dict()
+        self.parameters["url"] = url
+
+        self.headers["Accept"] = "text/json"
+
+        JobID = self._startAsyncJobMultipartFormData()
+
+        if not JobID:
+            raise ApiException("An error occurred launching the asynchronous call.")
+
+        noPings = 0
+
+        while (noPings < self.AsyncCallsMaxPings):
+            noPings += 1
+
+            # sleep for a few seconds before next ping
+            time.sleep(self.AsyncCallsPingInterval)
+
+            asyncJobClient = AsyncJobClient(self.parameters["key"], JobID)
+            asyncJobClient.setApiEndpoint(self.apiAsyncEndpoint)
+
+            result = asyncJobClient.getResult()
+
+            if asyncJobClient.finished():
+                self.numberOfPages = asyncJobClient.getNumberOfPages()
+                if result:
+                    return json.loads(result)
+                else:
+                    return []
+
+        raise ApiException("Asynchronous call did not finish in expected timeframe.")
+
+    def setCustomParameter(self, parameterName, parameterValue):
+        """Set a custom parameter. Do not use this method unless advised by SelectPdf.
+
+        ### Parameters
+
+        - parameterName: Parameter name.
+        - parameterValues: Parameter value.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+        
+        self.parameters[parameterName] = parameterValue
+        return self
+
+    def setTimeout(self, timeout):
+        """
+        Set the maximum amount of time (in seconds) for this job.
+        The default value is 30 seconds. 
+        Use a larger value (up to 120 seconds allowed) for large documents.
+
+        ### Parameters
+
+        - timeout: Timeout in seconds.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["timeout"] = timeout
+        return self
+
+    def setStartPage(self, startPage):
+        """
+        Set Start Page number. Default value is 1 (first page of the document).
+
+        ### Parameters
+
+        - startPage: Start page number (1-based).
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["start_page"] = startPage
+        return self
+
+    def setEndPage(self, endPage):
+        """
+        Set End Page number. Default value is 0 (process till the last page of the document).
+
+        ### Parameters
+
+        - endPage: End page number (1-based).
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["end_page"] = endPage
+        return self
+
+    def setUserPassword(self, userPassword):
+        """Set PDF user password.
+
+        ### Parameters
+
+        - userPassword: PDF user password.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        self.parameters["user_password"] = userPassword
+        return self
+
+    def setTextLayout(self, textLayout):
+        """Set the text layout. The default value is 0 - TextLayout.Original.
+
+        ### Parameters
+
+        - textLayout: The text layout. Possible values: 0 (Original), 1 (Reading). Use constants from selectpdf.TextLayout class.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        if textLayout != 0 and textLayout != 1:
+            raise ApiException("Allowed values for Text Layout: 0 (Original), 1 (Reading).")
+
+        self.parameters["text_layout"] = textLayout
+        return self
+
+    def setOutputFormat(self, outputFormat):
+        """Set the output format. The default value is 0 - OutputFormat.Text.
+
+        ### Parameters
+
+        - outputFormat: The output format. Possible values: 0 (Text), 1 (Html). Use constants from selectpdf.OutputFormat class.
+
+        ### Returns
+
+        Reference to the current object.
+        """
+
+        if outputFormat != 0 and outputFormat != 1:
+            raise ApiException("Allowed values for Output Format: 0 (Text), 1 (Html).")
+
+        self.parameters["output_format"] = outputFormat
         return self
