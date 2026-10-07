@@ -33,6 +33,10 @@ try:
 
     print ("Finished! Number of pages: {0}.".format(client.getNumberOfPages()))
 
+    # response telemetry
+    print ("Mode: {0}, Execution: {1}.".format(client.getMode(), client.getExecutionMode()))
+    print ("Credits remaining: {0} / {1}.".format(client.getCreditsRemaining(), client.getCreditsTotal()))
+
     # get API usage
     usageClient = selectpdf.UsageClient(apiKey)
     usage = usageClient.getUsage()
